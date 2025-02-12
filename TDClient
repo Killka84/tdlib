@@ -1,0 +1,574 @@
+#region сборка TdLib, Version=1.8.29.0, Culture=neutral, PublicKeyToken=null
+// C:\Users\Admin\.nuget\packages\tdlib\1.8.29\lib\netstandard2.0\TdLib.dll
+// Decompiled with ICSharpCode.Decompiler 8.1.1.7464
+#endregion
+
+using System;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using TdLib.Bindings;
+
+namespace TdLib;
+
+//
+// Сводка:
+//     TDLib client for using with generated APIs
+public class TdClient : TdApi.Client, IDisposable
+{
+    private TdJsonClient _tdJsonClient;
+
+    private int _taskId;
+
+    private readonly ConcurrentDictionary<int, Action<TdApi.Object>> _tasks;
+
+    private Receiver _receiver;
+
+    private TdApi.AuthorizationState _authorizationState;
+
+    private readonly object _disposeLock = new object();
+
+    private readonly object _updateLock = new object();
+
+    private readonly ConcurrentQueue<TdApi.Update> _updateBuffer = new ConcurrentQueue<TdApi.Update>();
+
+    private EventHandler<TdApi.Update> _updateReceived;
+
+    private int _updateReceiverCount;
+
+    public ITdLibBindings Bindings => _tdJsonClient.Bindings;
+
+    //
+    // Сводка:
+    //     How much time should wait for closed state
+    public TimeSpan TimeoutToClose { get; set; } = TimeSpan.FromMinutes(1.0);
+
+
+    //
+    // Сводка:
+    //     Provides updates from TDLib
+    public event EventHandler<TdApi.Update> UpdateReceived
+    {
+        add
+        {
+            lock (_updateLock)
+            {
+                _updateReceived = (EventHandler<TdApi.Update>)Delegate.Combine(_updateReceived, value);
+                TdApi.Update result;
+                while (_updateBuffer.TryDequeue(out result))
+                {
+                    _updateReceived(this, result);
+                }
+
+                _updateReceiverCount++;
+            }
+        }
+        remove
+        {
+            lock (_updateLock)
+            {
+                _updateReceived = (EventHandler<TdApi.Update>)Delegate.Remove(_updateReceived, value);
+                _updateReceiverCount--;
+            }
+        }
+    }
+
+    public TdClient()
+        : this(Interop.AutoDetectBindings())
+    {
+    }
+
+    public TdClient(ITdLibBindings bindings)
+    {
+        _tdJsonClient = new TdJsonClient(bindings);
+        _tasks = new ConcurrentDictionary<int, Action<TdApi.Object>>();
+        _receiver = new Receiver(_tdJsonClient);
+        _receiver.Received += OnReceived;
+        _receiver.AuthorizationStateChanged += OnAuthorizationStateChanged;
+        _receiver.Start();
+    }
+
+    private void OnReceived(object _, TdApi.Object obj)
+    {
+        if (int.TryParse(obj.Extra, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result) && _tasks.TryRemove(result, out var value))
+        {
+            value(obj);
+        }
+        else if (obj is TdApi.Update update)
+        {
+            if (_updateReceiverCount == 0)
+            {
+                _updateBuffer.Enqueue(update);
+            }
+            else
+            {
+                _updateReceived(this, update);
+            }
+        }
+    }
+
+    private void OnAuthorizationStateChanged(object sender, TdApi.AuthorizationState state)
+    {
+        _authorizationState = state;
+    }
+
+    //
+    // Сводка:
+    //     Executes function and ignores response
+    public override void Send<TResut>(TdApi.Function<TResut> function)
+    {
+        if (_receiver == null)
+        {
+            throw new ObjectDisposedException("TDLib client was disposed");
+        }
+
+        string data = JsonConvert.SerializeObject(function);
+        _tdJsonClient.Send(data);
+    }
+
+    //
+    // Сводка:
+    //     Synchronously executes function and returns response
+    public override TResult Execute<TResult>(TdApi.Function<TResult> function)
+    {
+        if (_receiver == null)
+        {
+            throw new ObjectDisposedException("TDLib client was disposed");
+        }
+
+        string data = JsonConvert.SerializeObject(function);
+        data = _tdJsonClient.Execute(data);
+        TdApi.Object? @object = JsonConvert.DeserializeObject<TdApi.Object>(data, new JsonConverter[1]
+        {
+            new Converter()
+        });
+        if (@object is TdApi.Error error)
+        {
+            throw new TdException(error);
+        }
+
+        return (TResult)@object;
+    }
+
+    //
+    // Сводка:
+    //     Asynchronously executes function and returns response
+    public override Task<TResult> ExecuteAsync<TResult>(TdApi.Function<TResult> function)
+    {
+        if (_receiver == null)
+        {
+            throw new ObjectDisposedException("TDLib client was disposed");
+        }
+
+        int key = Interlocked.Increment(ref _taskId);
+        TaskCompletionSource<TResult> tcs = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        function.Extra = key.ToString(CultureInfo.InvariantCulture);
+        _tasks.TryAdd(key, delegate (TdApi.Object structure)
+        {
+            if (structure is TdApi.Error error)
+            {
+                tcs.SetException(new TdException(error));
+            }
+            else if (structure is TResult result)
+            {
+                tcs.SetResult(result);
+            }
+        });
+        Send(function);
+        return tcs.Task;
+    }
+
+    //
+    // Сводка:
+    //     Disposes client and json client Updates are stopped from being sent to updates
+    //     handler
+    public void Dispose()
+    {
+        lock (_disposeLock)
+        {
+            if (_receiver != null && _tdJsonClient != null)
+            {
+                CloseSynchronously();
+                _receiver.Dispose();
+                _receiver.Received -= OnReceived;
+                _receiver.AuthorizationStateChanged -= OnAuthorizationStateChanged;
+                _receiver = null;
+                _tdJsonClient.Dispose();
+                _tdJsonClient = null;
+            }
+        }
+    }
+
+    private async Task CloseAsync()
+    {
+        TaskCompletionSource<TdApi.AuthorizationState> tcs = new TaskCompletionSource<TdApi.AuthorizationState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        EventHandler<TdApi.AuthorizationState> handler = delegate (object _, TdApi.AuthorizationState state)
+        {
+            if (state is TdApi.AuthorizationState.AuthorizationStateClosed)
+            {
+                tcs.SetResult(state);
+            }
+        };
+        try
+        {
+            _receiver.AuthorizationStateChanged += handler;
+            if (!(_authorizationState is TdApi.AuthorizationState.AuthorizationStateClosed))
+            {
+                await ExecuteAsync(new TdApi.Close()).ConfigureAwait(continueOnCapturedContext: false);
+                await Task.WhenAny(new Task[2]
+                {
+                    tcs.Task,
+                    Task.Delay(TimeoutToClose)
+                }).ConfigureAwait(continueOnCapturedContext: false);
+            }
+        }
+        finally
+        {
+            _receiver.AuthorizationStateChanged -= handler;
+        }
+    }
+
+    private void CloseSynchronously()
+    {
+        CloseAsync().GetAwaiter().GetResult();
+    }
+}
+#if false // Журнал декомпиляции
+Элементов в кэше: "311"
+------------------
+Разрешить: "netstandard, Version=2.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "netstandard, Version=2.1.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Внимание! Несовпадение версий. Ожидалось: "2.0.0.0", получено: "2.1.0.0"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\netstandard.dll"
+------------------
+Разрешить: "TdLib.Api, Version=1.8.29.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "TdLib.Api, Version=1.8.29.0, Culture=neutral, PublicKeyToken=null"
+Загрузить из: "C:\Users\Admin\.nuget\packages\tdlib.api\1.8.29\lib\netstandard2.0\TdLib.Api.dll"
+------------------
+Разрешить: "Newtonsoft.Json, Version=13.0.0.0, Culture=neutral, PublicKeyToken=30ad4fe6b2a6aeed"
+Найдена одна сборка: "Newtonsoft.Json, Version=13.0.0.0, Culture=neutral, PublicKeyToken=30ad4fe6b2a6aeed"
+Загрузить из: "C:\Users\Admin\.nuget\packages\newtonsoft.json\13.0.1\lib\netstandard2.0\Newtonsoft.Json.dll"
+------------------
+Разрешить: "System.Runtime, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.dll"
+------------------
+Разрешить: "System.IO.MemoryMappedFiles, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.IO.MemoryMappedFiles, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.MemoryMappedFiles.dll"
+------------------
+Разрешить: "System.IO.Pipes, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.IO.Pipes, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.Pipes.dll"
+------------------
+Разрешить: "System.Diagnostics.Process, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.Process, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.Process.dll"
+------------------
+Разрешить: "System.Security.Cryptography, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Security.Cryptography, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Security.Cryptography.dll"
+------------------
+Разрешить: "System.Memory, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Memory, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Memory.dll"
+------------------
+Разрешить: "System.Collections, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Collections, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Collections.dll"
+------------------
+Разрешить: "System.Collections.NonGeneric, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Collections.NonGeneric, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Collections.NonGeneric.dll"
+------------------
+Разрешить: "System.Collections.Concurrent, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Collections.Concurrent, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Collections.Concurrent.dll"
+------------------
+Разрешить: "System.ObjectModel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.ObjectModel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.ObjectModel.dll"
+------------------
+Разрешить: "System.Collections.Specialized, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Collections.Specialized, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Collections.Specialized.dll"
+------------------
+Разрешить: "System.ComponentModel.TypeConverter, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.ComponentModel.TypeConverter, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.ComponentModel.TypeConverter.dll"
+------------------
+Разрешить: "System.ComponentModel.EventBasedAsync, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.ComponentModel.EventBasedAsync, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.ComponentModel.EventBasedAsync.dll"
+------------------
+Разрешить: "System.ComponentModel.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.ComponentModel.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.ComponentModel.Primitives.dll"
+------------------
+Разрешить: "System.ComponentModel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.ComponentModel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.ComponentModel.dll"
+------------------
+Разрешить: "Microsoft.Win32.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "Microsoft.Win32.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\Microsoft.Win32.Primitives.dll"
+------------------
+Разрешить: "System.Console, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Console, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Console.dll"
+------------------
+Разрешить: "System.Data.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Data.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Data.Common.dll"
+------------------
+Разрешить: "System.Runtime.InteropServices, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.InteropServices, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.InteropServices.dll"
+------------------
+Разрешить: "System.Diagnostics.TraceSource, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.TraceSource, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.TraceSource.dll"
+------------------
+Разрешить: "System.Diagnostics.Contracts, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.Contracts, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.Contracts.dll"
+------------------
+Разрешить: "System.Diagnostics.TextWriterTraceListener, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.TextWriterTraceListener, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.TextWriterTraceListener.dll"
+------------------
+Разрешить: "System.Diagnostics.FileVersionInfo, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.FileVersionInfo, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.FileVersionInfo.dll"
+------------------
+Разрешить: "System.Diagnostics.StackTrace, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.StackTrace, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.StackTrace.dll"
+------------------
+Разрешить: "System.Diagnostics.Tracing, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Diagnostics.Tracing, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Diagnostics.Tracing.dll"
+------------------
+Разрешить: "System.Drawing.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Drawing.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Drawing.Primitives.dll"
+------------------
+Разрешить: "System.Linq.Expressions, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Linq.Expressions, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Linq.Expressions.dll"
+------------------
+Разрешить: "System.IO.Compression.Brotli, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "System.IO.Compression.Brotli, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.Compression.Brotli.dll"
+------------------
+Разрешить: "System.IO.Compression, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "System.IO.Compression, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.Compression.dll"
+------------------
+Разрешить: "System.IO.Compression.ZipFile, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "System.IO.Compression.ZipFile, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.Compression.ZipFile.dll"
+------------------
+Разрешить: "System.IO.FileSystem.DriveInfo, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.IO.FileSystem.DriveInfo, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.FileSystem.DriveInfo.dll"
+------------------
+Разрешить: "System.IO.FileSystem.Watcher, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.IO.FileSystem.Watcher, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.FileSystem.Watcher.dll"
+------------------
+Разрешить: "System.IO.IsolatedStorage, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.IO.IsolatedStorage, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.IO.IsolatedStorage.dll"
+------------------
+Разрешить: "System.Linq, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Linq, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Linq.dll"
+------------------
+Разрешить: "System.Linq.Queryable, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Linq.Queryable, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Linq.Queryable.dll"
+------------------
+Разрешить: "System.Linq.Parallel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Linq.Parallel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Linq.Parallel.dll"
+------------------
+Разрешить: "System.Threading.Thread, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Threading.Thread, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Threading.Thread.dll"
+------------------
+Разрешить: "System.Net.Requests, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.Requests, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Requests.dll"
+------------------
+Разрешить: "System.Net.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Primitives.dll"
+------------------
+Разрешить: "System.Net.HttpListener, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Net.HttpListener, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.HttpListener.dll"
+------------------
+Разрешить: "System.Net.NameResolution, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.NameResolution, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.NameResolution.dll"
+------------------
+Разрешить: "System.Net.WebClient, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Net.WebClient, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.WebClient.dll"
+------------------
+Разрешить: "System.Net.Http, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.Http, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Http.dll"
+------------------
+Разрешить: "System.Net.WebHeaderCollection, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.WebHeaderCollection, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.WebHeaderCollection.dll"
+------------------
+Разрешить: "System.Net.WebProxy, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Net.WebProxy, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.WebProxy.dll"
+------------------
+Разрешить: "System.Net.Mail, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Net.Mail, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Mail.dll"
+------------------
+Разрешить: "System.Net.NetworkInformation, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.NetworkInformation, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.NetworkInformation.dll"
+------------------
+Разрешить: "System.Net.Ping, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.Ping, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Ping.dll"
+------------------
+Разрешить: "System.Net.Security, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.Security, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Security.dll"
+------------------
+Разрешить: "System.Net.Sockets, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.Sockets, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.Sockets.dll"
+------------------
+Разрешить: "System.Net.WebSockets.Client, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.WebSockets.Client, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.WebSockets.Client.dll"
+------------------
+Разрешить: "System.Net.WebSockets, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Net.WebSockets, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Net.WebSockets.dll"
+------------------
+Разрешить: "System.Runtime.Numerics, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.Numerics, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.Numerics.dll"
+------------------
+Разрешить: "System.Numerics.Vectors, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Numerics.Vectors, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Numerics.Vectors.dll"
+------------------
+Разрешить: "System.Reflection.DispatchProxy, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Reflection.DispatchProxy, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Reflection.DispatchProxy.dll"
+------------------
+Разрешить: "System.Reflection.Emit, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Reflection.Emit, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Reflection.Emit.dll"
+------------------
+Разрешить: "System.Reflection.Emit.ILGeneration, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Reflection.Emit.ILGeneration, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Reflection.Emit.ILGeneration.dll"
+------------------
+Разрешить: "System.Reflection.Emit.Lightweight, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Reflection.Emit.Lightweight, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Reflection.Emit.Lightweight.dll"
+------------------
+Разрешить: "System.Reflection.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Reflection.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Reflection.Primitives.dll"
+------------------
+Разрешить: "System.Resources.Writer, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Resources.Writer, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Resources.Writer.dll"
+------------------
+Разрешить: "System.Runtime.CompilerServices.VisualC, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.CompilerServices.VisualC, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.CompilerServices.VisualC.dll"
+------------------
+Разрешить: "System.Runtime.Serialization.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.Serialization.Primitives, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.Serialization.Primitives.dll"
+------------------
+Разрешить: "System.Runtime.Serialization.Xml, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.Serialization.Xml, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.Serialization.Xml.dll"
+------------------
+Разрешить: "System.Runtime.Serialization.Json, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.Serialization.Json, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.Serialization.Json.dll"
+------------------
+Разрешить: "System.Runtime.Serialization.Formatters, Version=8.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Runtime.Serialization.Formatters, Version=8.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.Serialization.Formatters.dll"
+------------------
+Разрешить: "System.Security.Claims, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Security.Claims, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Security.Claims.dll"
+------------------
+Разрешить: "System.Text.Encoding.Extensions, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Text.Encoding.Extensions, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Text.Encoding.Extensions.dll"
+------------------
+Разрешить: "System.Text.RegularExpressions, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Text.RegularExpressions, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Text.RegularExpressions.dll"
+------------------
+Разрешить: "System.Threading, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Threading, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Threading.dll"
+------------------
+Разрешить: "System.Threading.Overlapped, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Threading.Overlapped, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Threading.Overlapped.dll"
+------------------
+Разрешить: "System.Threading.ThreadPool, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Threading.ThreadPool, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Threading.ThreadPool.dll"
+------------------
+Разрешить: "System.Threading.Tasks.Parallel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Threading.Tasks.Parallel, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Threading.Tasks.Parallel.dll"
+------------------
+Разрешить: "System.Transactions.Local, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Transactions.Local, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Transactions.Local.dll"
+------------------
+Разрешить: "System.Web.HttpUtility, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Найдена одна сборка: "System.Web.HttpUtility, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Web.HttpUtility.dll"
+------------------
+Разрешить: "System.Xml.ReaderWriter, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Xml.ReaderWriter, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Xml.ReaderWriter.dll"
+------------------
+Разрешить: "System.Xml.XDocument, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Xml.XDocument, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Xml.XDocument.dll"
+------------------
+Разрешить: "System.Xml.XmlSerializer, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Xml.XmlSerializer, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Xml.XmlSerializer.dll"
+------------------
+Разрешить: "System.Xml.XPath.XDocument, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Xml.XPath.XDocument, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Xml.XPath.XDocument.dll"
+------------------
+Разрешить: "System.Xml.XPath, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Найдена одна сборка: "System.Xml.XPath, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Xml.XPath.dll"
+------------------
+Разрешить: "System.Runtime.CompilerServices.Unsafe, Version=2.0.0.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "System.Runtime.CompilerServices.Unsafe, Version=9.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+Внимание! Несовпадение версий. Ожидалось: "2.0.0.0", получено: "9.0.0.0"
+Загрузить из: "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\9.0.0\ref\net9.0\System.Runtime.CompilerServices.Unsafe.dll"
+#endif
